@@ -202,6 +202,14 @@
     <div class="head-actions" style="margin-top:12px"><button class="btn btn-primary" id="driveSaveSyncBtn" onclick="saveDriveAndSync()">حفظ ومزامنة Drive</button><button class="btn btn-light" id="driveSyncBtn" onclick="syncDrive()">مزامنة الآن</button></div>
     <div class="drive-status" id="driveSettingsStatus"></div>
   </div>
+  <div class="drive-settings" style="margin-top:12px">
+    <div class="drive-settings-head"><h3>مزامنة الأجهزة</h3><span class="pill" id="sharedConnectionPill">محلي فقط</span></div>
+    <div class="head-actions" style="margin-top:4px">
+      <button class="btn btn-primary" id="sharedSyncBtn" onclick="syncSharedStateNow()">مزامنة البيانات الآن</button>
+      <button class="btn btn-light" id="deviceSetupLinkBtn" onclick="copyDeviceSetupLink()">نسخ رابط إعداد جهاز جديد</button>
+    </div>
+    <div class="drive-status" id="sharedSyncStatus"></div>
+  </div>
 </section>
 
 </main>
@@ -230,7 +238,10 @@ const INITIAL_DB={"records":[{"id":"Q-2026-001","serial":"1","dailyIndex":1,"pro
 const STORAGE_KEY='tamam_moqayasat_2026_standalone_v3';
 let DB={records:[],reportRecords:[],headers:[],stages:[]};let currentView='reports',page=1,pageSize=18,editingId=null,scanTargetId=null,setupBound=false;
 let driveSyncTimer=null,driveSyncInFlight=false,driveLinkTargetId=null;
+let sharedSyncTimer=null,sharedSaveTimer=null,sharedSyncInFlight=false,sharedSaveInFlight=false,sharedSyncReady=false,suppressSharedSave=false,sharedRemotePending=false,lastSharedSerialized='';
 const DRIVE_SYNC_MS=10*60*1000;
+const SHARED_SYNC_MS=20*1000;
+const SHARED_SAVE_DEBOUNCE_MS=700;
 function ensureDriveState(){
   DB.driveConfig=DB.driveConfig&&typeof DB.driveConfig==='object'?DB.driveConfig:{folderId:'',webAppUrl:''};
   DB.driveFiles=Array.isArray(DB.driveFiles)?DB.driveFiles:[];
@@ -240,13 +251,93 @@ function ensureDriveState(){
   DB.driveSyncError=DB.driveSyncError||'';
   DB.driveSyncStats=DB.driveSyncStats&&typeof DB.driveSyncStats==='object'?DB.driveSyncStats:{detected:0,auto:0,manual:0,review:0,unmatched:0};
   DB.dismissedReminders=DB.dismissedReminders&&typeof DB.dismissedReminders==='object'?DB.dismissedReminders:{};
+  DB.sharedSync=DB.sharedSync&&typeof DB.sharedSync==='object'?DB.sharedSync:{version:'',lastLoaded:'',lastSaved:'',error:'',spreadsheetUrl:''};
 }
 const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(msg,type='good'){const e=document.createElement('div');e.className='toast '+type;e.textContent=msg;$('toastWrap').appendChild(e);setTimeout(()=>e.remove(),3300)}
 function clone(v){return JSON.parse(JSON.stringify(v))}
-function saveState(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(DB))}catch(e){toast('تعذر حفظ البيانات في المتصفح. مساحة التخزين ممتلئة.','bad')}}
-function migrateDismissedRemindersToDeleted(){if(DB.reminderDeleteMigrationV2)return;const dismissed=DB.dismissedReminders||{};let changed=false;for(const key of Object.keys(dismissed)){const sep=key.indexOf('|');if(sep<0)continue;const id=key.slice(0,sep),date=key.slice(sep+1),r=DB.records.find(x=>x.id===id);if(r&&r.reminderDate===date){r.reminderDate='';changed=true}}DB.dismissedReminders={};DB.reminderDeleteMigrationV2=true;if(changed)saveState()}
-async function load(){try{const s=localStorage.getItem(STORAGE_KEY);DB=s?JSON.parse(s):clone(INITIAL_DB)}catch(e){DB=clone(INITIAL_DB)};ensureDriveState();migrateDismissedRemindersToDeleted();DB.records.forEach(r=>{r.scanName=r.uploadedScanName||r.scanName||r.sourcePdfName||'';r.scanAvailable=!!(r.uploadedScanName||r.sourcePdf||relatedDriveFiles(r.id,'measurement').length)});setup();renderAll();renderDriveSettings();startDriveAutoSync();startReminderWatcher()}
+function persistLocalState(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(DB))}catch(e){toast('تعذر حفظ البيانات في المتصفح. مساحة التخزين ممتلئة.','bad')}}
+function saveState(){persistLocalState();if(sharedSyncReady&&!suppressSharedSave)scheduleSharedStateSave()}
+function migrateDismissedRemindersToDeleted(){if(DB.reminderDeleteMigrationV2)return;const dismissed=DB.dismissedReminders||{};let changed=false;for(const key of Object.keys(dismissed)){const sep=key.indexOf('|');if(sep<0)continue;const id=key.slice(0,sep),date=key.slice(sep+1),r=DB.records.find(x=>x.id===id);if(r&&r.reminderDate===date){r.reminderDate='';r.updatedAt=r.updatedAt||new Date().toISOString();changed=true}}DB.dismissedReminders={};DB.reminderDeleteMigrationV2=true;if(changed)saveState()}
+function bridgeUrl(){return clean(DB.driveConfig?.webAppUrl||'')}
+function sharedConfigured(){return validWebAppUrl(bridgeUrl())}
+function hydrateDeviceConfigFromUrl(){
+  try{
+    const u=new URL(location.href),bridge=clean(u.searchParams.get('bridge')),folder=clean(u.searchParams.get('folder'));let changed=false;
+    if(bridge&&validWebAppUrl(bridge)){DB.driveConfig.webAppUrl=bridge;changed=true}
+    if(folder&&parseFolderId(folder)){DB.driveConfig.folderId=parseFolderId(folder);changed=true}
+    if(changed){u.searchParams.delete('bridge');u.searchParams.delete('folder');history.replaceState(null,'',u.pathname+(u.search?u.search:'')+u.hash);persistLocalState()}
+  }catch{}
+}
+function cleanSharedRecordForUpload(r){
+  const x=clone(r||{});delete x.rawFields;
+  if(x.uploadedScanName){if(x.scanName===x.uploadedScanName)x.scanName=x.sourcePdfName||'';x.uploadedScanName=''}
+  return x
+}
+function buildSharedState(){
+  ensureDriveState();
+  return {schemaVersion:1,records:(DB.records||[]).map(cleanSharedRecordForUpload),reportRecords:clone(DB.reportRecords||[]),headers:clone(DB.headers||[]),stages:clone(DB.stages||[]),manualDriveLinks:clone(DB.manualDriveLinks||{}),driveConfig:{folderId:parseFolderId(DB.driveConfig?.folderId)||''},reminderDeleteMigrationV2:!!DB.reminderDeleteMigrationV2}
+}
+function captureViewState(){return {search:$('search')?.value||'',stage:$('stageFilter')?.value||'all',project:$('projectFilter')?.value||'all',reminder:$('reminderFilter')?.value||'all',reportSearch:$('reportSearch')?.value||'',reportProject:$('reportProject')?.value||'all',scanSearch:$('scanSearch')?.value||'',scanStatus:$('scanStatusFilter')?.value||'all',scanType:$('scanTypeFilter')?.value||'all'}}
+function restoreSelectValue(id,value){const e=$(id);if(e&&[...e.options].some(o=>o.value===value))e.value=value}
+function restoreViewState(v){if(!v)return;if($('search'))$('search').value=v.search||'';restoreSelectValue('stageFilter',v.stage);restoreSelectValue('projectFilter',v.project);restoreSelectValue('reminderFilter',v.reminder);if($('reportSearch'))$('reportSearch').value=v.reportSearch||'';restoreSelectValue('reportProject',v.reportProject);if($('scanSearch'))$('scanSearch').value=v.scanSearch||'';restoreSelectValue('scanStatusFilter',v.scanStatus);restoreSelectValue('scanTypeFilter',v.scanType)}
+function applySharedState(state,meta={}){
+  if(!state||!Array.isArray(state.records))throw new Error('بيانات المزامنة غير صالحة');
+  const viewState=captureViewState(),localUploads=new Map((DB.records||[]).map(r=>[r.id,{uploadedScanName:r.uploadedScanName||'',scanName:r.scanName||''}]));
+  const keep={webAppUrl:bridgeUrl(),driveFiles:clone(DB.driveFiles||[]),driveScanLinks:clone(DB.driveScanLinks||{}),lastDriveSync:DB.lastDriveSync||'',driveSyncError:DB.driveSyncError||'',driveSyncStats:clone(DB.driveSyncStats||{}),sharedSync:clone(DB.sharedSync||{})};
+  suppressSharedSave=true;
+  try{
+    DB.records=clone(state.records||[]).map(r=>{const local=localUploads.get(r.id);if(local?.uploadedScanName){r.uploadedScanName=local.uploadedScanName;r.scanName=local.scanName||r.scanName}return r});
+    DB.reportRecords=clone(state.reportRecords||[]);DB.headers=clone(state.headers||[]);DB.stages=clone(state.stages||[]);DB.manualDriveLinks=clone(state.manualDriveLinks||{});DB.reminderDeleteMigrationV2=!!state.reminderDeleteMigrationV2;
+    DB.driveConfig={folderId:parseFolderId(state.driveConfig?.folderId)||DB.driveConfig?.folderId||'',webAppUrl:keep.webAppUrl};DB.driveFiles=keep.driveFiles;DB.driveScanLinks=keep.driveScanLinks;DB.lastDriveSync=keep.lastDriveSync;DB.driveSyncError=keep.driveSyncError;DB.driveSyncStats=keep.driveSyncStats;DB.sharedSync=keep.sharedSync;
+    ensureDriveState();
+    if(currentDriveFiles().length)processDriveFiles(currentDriveFiles());
+    DB.records.forEach(r=>{r.scanName=r.uploadedScanName||r.scanName||r.sourcePdfName||'';r.scanAvailable=!!(r.uploadedScanName||r.sourcePdf||relatedDriveFiles(r.id,'measurement').length)});
+    DB.sharedSync.version=clean(meta.version)||DB.sharedSync.version||'';DB.sharedSync.lastLoaded=new Date().toISOString();DB.sharedSync.error='';DB.sharedSync.spreadsheetUrl=clean(meta.spreadsheetUrl)||DB.sharedSync.spreadsheetUrl||'';
+    lastSharedSerialized=JSON.stringify(buildSharedState());persistLocalState();setup();restoreViewState(viewState);renderAll()
+  }finally{suppressSharedSave=false}
+}
+async function requestBridgeGet(params){
+  const url=bridgeUrl();if(!validWebAppUrl(url))throw new Error('رابط Apps Script غير مهيأ');const u=new URL(url);Object.entries({...params,_ts:String(Date.now())}).forEach(([k,v])=>u.searchParams.set(k,String(v??'')));
+  try{const res=await fetch(u.toString(),{method:'GET',redirect:'follow',credentials:'omit',cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);return await res.json()}catch(fetchErr){return await jsonpDrive(url,{...params,_ts:String(Date.now())})}
+}
+function postBridgeFormFallback(url,fields){return new Promise((resolve,reject)=>{if(typeof navigator!=='undefined'&&navigator.onLine===false){reject(new Error('لا يوجد اتصال بالإنترنت'));return}const name='syncFrame_'+Date.now(),frame=document.createElement('iframe'),form=document.createElement('form');frame.name=name;frame.style.display='none';form.method='POST';form.action=url;form.target=name;form.style.display='none';Object.entries(fields).forEach(([k,v])=>{const input=document.createElement('input');input.type='hidden';input.name=k;input.value=String(v??'');form.appendChild(input)});document.body.append(frame,form);try{form.submit()}catch(e){form.remove();frame.remove();reject(e);return}setTimeout(()=>{form.remove();frame.remove();resolve({ok:true,queued:true})},1800)})}
+async function requestBridgePost(fields){
+  const url=bridgeUrl();if(!validWebAppUrl(url))throw new Error('رابط Apps Script غير مهيأ');const body=new URLSearchParams();Object.entries(fields).forEach(([k,v])=>body.set(k,String(v??'')));
+  try{const res=await fetch(url,{method:'POST',body,redirect:'follow',credentials:'omit'});if(!res.ok)throw new Error('HTTP '+res.status);const data=await res.json();return data}catch(fetchErr){return await postBridgeFormFallback(url,fields)}
+}
+function scheduleSharedStateSave(){if(!sharedConfigured())return;clearTimeout(sharedSaveTimer);sharedSaveTimer=setTimeout(()=>saveSharedState({quiet:true}),SHARED_SAVE_DEBOUNCE_MS)}
+async function saveSharedState(opts={}){
+  if(!sharedConfigured()||sharedSaveInFlight)return false;const state=buildSharedState(),serialized=JSON.stringify(state);if(!opts.force&&serialized===lastSharedSerialized)return true;
+  sharedSaveInFlight=true;renderSharedSyncStatus();
+  try{const data=await requestBridgePost({action:'stateSave',payload:serialized});if(data&&data.ok===false)throw new Error(clean(data.message||data.error)||'تعذر حفظ البيانات المركزية');lastSharedSerialized=serialized;DB.sharedSync.lastSaved=new Date().toISOString();DB.sharedSync.error='';if(data?.version)DB.sharedSync.version=String(data.version);if(data?.spreadsheetUrl)DB.sharedSync.spreadsheetUrl=String(data.spreadsheetUrl);persistLocalState();renderSharedSyncStatus();if(!opts.quiet)toast(data?.queued?'تم إرسال البيانات وسيتم التحقق تلقائياً':'تمت مزامنة البيانات بين الأجهزة');return true}
+  catch(e){DB.sharedSync.error=clean(e.message)||'تعذر مزامنة البيانات';persistLocalState();renderSharedSyncStatus();if(!opts.quiet)toast('تعذر مزامنة البيانات بين الأجهزة','bad');return false}
+  finally{sharedSaveInFlight=false;renderSharedSyncStatus()}
+}
+async function loadSharedState(opts={}){
+  if(!sharedConfigured()||sharedSyncInFlight)return false;if(document.querySelector('#quoteModal.show')&&!opts.force){sharedRemotePending=true;return false}sharedSyncInFlight=true;renderSharedSyncStatus();
+  try{const data=await requestBridgeGet({action:'stateLoad'});if(!data||data.ok===false)throw new Error(clean(data?.message||data?.error)||'تعذر قراءة البيانات المركزية');if(!data.exists){if(opts.bootstrap)await saveSharedState({quiet:opts.quiet,force:true});return false}applySharedState(data.state,{version:data.version,spreadsheetUrl:data.spreadsheetUrl});sharedRemotePending=false;if(!opts.quiet)toast('تم تحميل أحدث البيانات');return true}
+  catch(e){DB.sharedSync.error=clean(e.message)||'تعذر مزامنة البيانات';persistLocalState();renderSharedSyncStatus();if(!opts.quiet)toast('تعذر تحميل البيانات المركزية','bad');return false}
+  finally{sharedSyncInFlight=false;renderSharedSyncStatus()}
+}
+async function checkSharedStateUpdates(opts={}){
+  if(!sharedConfigured()||sharedSyncInFlight||sharedSaveInFlight)return;if(document.hidden&&!opts.force)return;
+  try{const meta=await requestBridgeGet({action:'stateMeta'});if(!meta||meta.ok===false)return;if(!meta.exists){if(opts.bootstrap||lastSharedSerialized)await saveSharedState({quiet:true,force:true});return}const localSerialized=JSON.stringify(buildSharedState()),localChanged=!!lastSharedSerialized&&localSerialized!==lastSharedSerialized,remoteChanged=!DB.sharedSync.version||String(meta.version)!==String(DB.sharedSync.version);if(localChanged){if(!remoteChanged){await saveSharedState({quiet:true,force:true});return}DB.sharedSync.error='توجد تغييرات غير متزامنة على أكثر من جهاز — اضغط مزامنة البيانات الآن على الجهاز الذي تريد اعتماد تعديلاته';renderSharedSyncStatus();return}if(remoteChanged){await loadSharedState({quiet:true,force:!!opts.force})}else{DB.sharedSync.error='';DB.sharedSync.spreadsheetUrl=clean(meta.spreadsheetUrl)||DB.sharedSync.spreadsheetUrl||'';renderSharedSyncStatus()}}catch(e){DB.sharedSync.error=clean(e.message)||'تعذر التحقق من المزامنة';renderSharedSyncStatus()}
+}
+function startSharedAutoSync(){if(sharedSyncTimer)return;sharedSyncTimer=setInterval(()=>checkSharedStateUpdates(),SHARED_SYNC_MS);document.addEventListener('visibilitychange',()=>{if(!document.hidden)checkSharedStateUpdates({force:true})});window.addEventListener('focus',()=>checkSharedStateUpdates({force:true}))}
+async function syncSharedStateNow(){if(!sharedConfigured()){toast('أدخل رابط Apps Script أولاً','bad');switchView('settings');return}clearTimeout(sharedSaveTimer);const local=JSON.stringify(buildSharedState()),hasLocalChanges=!!lastSharedSerialized&&local!==lastSharedSerialized;const meta=await requestBridgeGet({action:'stateMeta'}).catch(()=>null);if(!meta?.exists){await saveSharedState({quiet:false,force:true});return}if(hasLocalChanges){await saveSharedState({quiet:false,force:true});return}if(!DB.sharedSync.version||String(meta.version)!==String(DB.sharedSync.version)){await loadSharedState({quiet:false,force:true});return}await saveSharedState({quiet:false,force:true})}
+async function copyDeviceSetupLink(){
+  if(!sharedConfigured()){toast('أدخل رابط Apps Script أولاً','bad');return}try{const u=new URL(location.href);u.searchParams.set('bridge',bridgeUrl());const folder=parseFolderId(DB.driveConfig?.folderId);if(folder)u.searchParams.set('folder',folder);const text=u.toString();if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(text);else{const t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove()}toast('تم نسخ رابط إعداد الجهاز الجديد')}catch(e){toast('تعذر نسخ الرابط','bad')}
+}
+function renderSharedSyncStatus(){
+  if(!$('sharedSyncStatus'))return;ensureDriveState();const configured=sharedConfigured(),busy=sharedSyncInFlight||sharedSaveInFlight,err=clean(DB.sharedSync?.error),pill=$('sharedConnectionPill');if(pill){pill.textContent=!configured?'محلي فقط':busy?'جاري المزامنة':err?'خطأ في المزامنة':'متصل';pill.className='pill '+(configured&&!err?'green':err?'red':'')}
+  const lastSaved=DB.sharedSync?.lastSaved?new Date(DB.sharedSync.lastSaved).toLocaleString('ar-EG'):'—',lastLoaded=DB.sharedSync?.lastLoaded?new Date(DB.sharedSync.lastLoaded).toLocaleString('ar-EG'):'—';$('sharedSyncStatus').innerHTML=`<div class="drive-stat"><span>آخر رفع</span><strong>${esc(lastSaved)}</strong></div><div class="drive-stat"><span>آخر استلام</span><strong>${esc(lastLoaded)}</strong></div><div class="drive-stat"><span>الحالة</span><strong>${configured?(err?esc(err):'المزامنة المركزية فعالة'):'أدخل Apps Script Web App URL'}</strong></div>`
+}
+async function load(){
+  let hadLocalState=false;try{const s=localStorage.getItem(STORAGE_KEY);hadLocalState=!!s;DB=s?JSON.parse(s):clone(INITIAL_DB)}catch(e){DB=clone(INITIAL_DB)};ensureDriveState();hydrateDeviceConfigFromUrl();migrateDismissedRemindersToDeleted();
+  if(sharedConfigured())await loadSharedState({quiet:true,bootstrap:hadLocalState});
+  DB.records.forEach(r=>{r.scanName=r.uploadedScanName||r.scanName||r.sourcePdfName||'';r.scanAvailable=!!(r.uploadedScanName||r.sourcePdf||relatedDriveFiles(r.id,'measurement').length)});setup();renderAll();renderDriveSettings();renderSharedSyncStatus();sharedSyncReady=true;startSharedAutoSync();startDriveAutoSync();startReminderWatcher()
+}
 function setup(){
   $('stageFilter').innerHTML='<option value="all">كل المراحل</option><option value="-1">غير مرتبط بالمتابعة</option>'+DB.stages.map((s,i)=>`<option value="${i}">${esc(s)}</option>`).join('');
   $('fStage').innerHTML='<option value="-1">غير محددة</option>'+DB.stages.map((s,i)=>`<option value="${i}">${esc(s)}</option>`).join('');
@@ -257,7 +348,7 @@ function setup(){
   if($('driveWebAppInput'))$('driveWebAppInput').value=DB.driveConfig?.webAppUrl||'';
   if(!setupBound){setupBound=true}
 }
-function renderAll(){renderEstimates();renderReports();renderNotifications();renderScans();renderDriveSettings()}
+function renderAll(){renderEstimates();renderReports();renderNotifications();renderScans();renderDriveSettings();renderSharedSyncStatus()}
 function switchView(v){currentView=v;document.querySelectorAll('.view').forEach(x=>x.classList.add('hidden'));$(v+'View').classList.remove('hidden');document.querySelectorAll('.topnav button').forEach(b=>b.classList.toggle('active',b.dataset.view===v));if(v==='scans')renderScans();if(v==='settings')renderDriveSettings()}
 document.querySelectorAll('.topnav button').forEach(b=>b.onclick=()=>switchView(b.dataset.view));
 function fmtDate(d){if(!d)return'—';const x=new Date(d+'T00:00:00');return isNaN(x)?d:x.toLocaleDateString('ar-EG',{year:'numeric',month:'2-digit',day:'2-digit'})}
@@ -375,20 +466,20 @@ async function requestDriveListing(url,folderId){
   const params={folderId,recursive:'1',_ts:String(Date.now())},u=new URL(url);Object.entries(params).forEach(([k,v])=>u.searchParams.set(k,v));
   try{const res=await fetch(u.toString(),{method:'GET',redirect:'follow',credentials:'omit'});if(!res.ok)throw new Error('HTTP '+res.status);const data=await res.json();return data}catch(fetchErr){return await jsonpDrive(url,params)}
 }
-function setSyncBusy(b){['scanSyncBtn','driveSyncBtn','driveSaveSyncBtn'].forEach(id=>{const e=$(id);if(e){e.disabled=!!b;e.classList.toggle('syncing',!!b)}})}
+function setSyncBusy(b){['scanSyncBtn','driveSyncBtn','driveSaveSyncBtn','sharedSyncBtn'].forEach(id=>{const e=$(id);if(e){e.disabled=!!b;e.classList.toggle('syncing',!!b)}})}
 async function saveDriveAndSync(){
   ensureDriveState();const folderId=parseFolderId($('driveFolderInput').value),webAppUrl=clean($('driveWebAppInput').value);
   if(!folderId){toast('رابط مجلد Google Drive أو Folder ID غير صحيح','bad');return}
   if(!validWebAppUrl(webAppUrl)){toast('رابط Apps Script Web App غير صحيح','bad');return}
-  DB.driveConfig={folderId,webAppUrl};saveState();renderDriveSettings();startDriveAutoSync();await syncDrive()
+  const establishedSharedDevice=!!DB.sharedSync?.version||!!lastSharedSerialized;DB.driveConfig={folderId,webAppUrl};persistLocalState();renderDriveSettings();renderSharedSyncStatus();startDriveAutoSync();startSharedAutoSync();await syncDrive();if(establishedSharedDevice)await saveSharedState({quiet:true,force:true});else await checkSharedStateUpdates({bootstrap:true,force:true})
 }
 async function syncDrive(opts={}){
   ensureDriveState();if(driveSyncInFlight)return;
   const folderId=parseFolderId(DB.driveConfig?.folderId),url=clean(DB.driveConfig?.webAppUrl);
   if(!folderId||!validWebAppUrl(url)){DB.driveSyncError='ربط Google Drive غير مكتمل';renderDriveSettings();if(!opts.quiet)toast('ربط Google Drive غير مكتمل','bad');return}
   driveSyncInFlight=true;setSyncBusy(true);
-  try{const data=await requestDriveListing(url,folderId);if(!data||data.ok===false)throw new Error(clean(data?.message||data?.error)||'تعذر الوصول إلى مجلد Google Drive');const files=Array.isArray(data)?data:(Array.isArray(data.files)?data.files:[]);processDriveFiles(files);saveState();renderAll();if(!opts.quiet)toast(`تمت المزامنة — ${DB.driveSyncStats.detected} ملف PDF`)}
-  catch(e){DB.driveSyncError=clean(e.message)||'تعذر مزامنة الصور الضوئية';saveState();renderDriveSettings();renderScans();if(!opts.quiet)toast('تعذر مزامنة الصور الضوئية','bad')}
+  try{const data=await requestDriveListing(url,folderId);if(!data||data.ok===false)throw new Error(clean(data?.message||data?.error)||'تعذر الوصول إلى مجلد Google Drive');const files=Array.isArray(data)?data:(Array.isArray(data.files)?data.files:[]);processDriveFiles(files);suppressSharedSave=true;try{persistLocalState()}finally{suppressSharedSave=false}renderAll();if(!opts.quiet)toast(`تمت المزامنة — ${DB.driveSyncStats.detected} ملف PDF`)}
+  catch(e){DB.driveSyncError=clean(e.message)||'تعذر مزامنة الصور الضوئية';suppressSharedSave=true;try{persistLocalState()}finally{suppressSharedSave=false}renderDriveSettings();renderScans();if(!opts.quiet)toast('تعذر مزامنة الصور الضوئية','bad')}
   finally{driveSyncInFlight=false;setSyncBusy(false)}
 }
 function startDriveAutoSync(){
@@ -453,7 +544,7 @@ function dismissNotification(id){deleteReminder(id)}
 function renderNotifications(){DB.dismissedReminders=DB.dismissedReminders||{};const due=DB.records.filter(r=>isDue(r)&&!DB.dismissedReminders[reminderNotificationKey(r)]).sort((a,b)=>String(a.reminderDate).localeCompare(String(b.reminderDate)));$('notifBadge').textContent=due.length;$('notifBadge').classList.toggle('hidden',!due.length);$('notifList').innerHTML=due.length?due.map(r=>`<div class="notif"><strong>${esc(r.company)}</strong><small>${esc(r.project)}</small><small>موعد المتابعة: ${fmtDate(r.reminderDate)}</small><div class="notif-actions"><button class="btn btn-light btn-sm" onclick="closeOverlays();switchView('estimates');openQuoteForm('${r.id}')">فتح المقايسة</button><button class="btn btn-danger btn-sm" onclick="deleteReminder('${r.id}')">حذف التذكير</button></div></div>`).join(''):'<div style="padding:25px;text-align:center;color:#7d8b94">لا توجد تنبيهات حالياً</div>'}
 $('notifBtn').onclick=()=>{$('notifDrawer').classList.add('open');$('backdrop').classList.add('show')};$('backdrop').onclick=closeOverlays;
 function openModal(id){$(id).classList.add('show');$('backdrop').classList.add('show')}
-function closeOverlays(){document.querySelectorAll('.modal.show').forEach(x=>x.classList.remove('show'));$('notifDrawer').classList.remove('open');closeScan();$('backdrop').classList.remove('show')}
+function closeOverlays(){document.querySelectorAll('.modal.show').forEach(x=>x.classList.remove('show'));$('notifDrawer').classList.remove('open');closeScan();$('backdrop').classList.remove('show');if(sharedRemotePending)setTimeout(()=>checkSharedStateUpdates({force:true}),50)}
 load().catch(e=>toast(e.message,'bad'));
 </script>
 </body>
